@@ -1,0 +1,163 @@
+# -----------------------------------------------------------------------------------------
+# Point Projection Tool for ArcMap
+# -----------------------------------------------------------------------------------------
+# Script Author: Rebecca G. Englert
+# Last Updated: August 21, 2020
+# Reviewed By: Thomas G. E. Peploe on July 7, 2025
+#
+# Description:
+# This script performs 3D point projection onto a plane defined by dip direction and dip
+# angle. Input data can be:
+#   - Polyline shapefiles from Pix4D (converted to vertices), or
+#   - Existing point shapefiles with attribute fields.
+#
+# Output is a .dbf table containing along-strike (X) and along-dip (Z) distances relative
+# to an intersection plane origin, which can be used to reconstruct 2D stratigraphic panels.
+#
+# -----------------------------------------------------------------------------------------
+# INPUT PARAMETERS:
+#   0. workspace     – Output folder path (e.g., C:/Project/Output/)
+#   1. shapefile     – Pix4D polyline shapefile to convert to points (optional)
+#   2. m             – Characters to retain in point names (e.g., 6)
+#   3. name          – Base name for output .dbf (e.g., "Projected_Points")
+#   4. points        – Additional point shapefiles with name fields (format: "shp1 Name;shp2 ID")
+#   5. ve            – Vertical exaggeration factor (typically 1 or 2)
+#   6. dd            – Dip direction in degrees (azimuth from 0–360)
+#   7. dip           – Dip angle in degrees (0–90)
+#   8. Xplane        – X-coordinate of intersection plane origin
+#   9. Yplane        – Y-coordinate of intersection plane origin
+#  10. Zplane        – Z-coordinate of intersection plane origin
+#
+# -----------------------------------------------------------------------------------------
+# OUTPUT:
+# Creates a .dbf table in the workspace with:
+#   - X: along-strike distance
+#   - Z: along-dip distance (with VE applied)
+#   - Name: point name (spaces replaced with underscores)
+#
+# -----------------------------------------------------------------------------------------
+# NOTES:
+# - If using Pix4D shapefiles, they must be *polyline* type, not points.
+# - Temporary file 'vertices.shp' will be created and deleted.
+# - Ensure name fields exist and match those provided.
+# - Along-strike direction (positive/negative) is determined relative to a dip-direction
+#   line in 2D space intersecting the origin (see Figures 7–9 in manuscript).
+#
+# -----------------------------------------------------------------------------------------
+
+import arcpy
+from arcpy import env
+import math
+
+# SET WORKSPACE
+workspace = arcpy.GetParameterAsText(0)
+arcpy.env.workspace = workspace
+arcpy.env.overwriteOutput = "TRUE"
+
+# DEFINE INPUTS
+shapefile = arcpy.GetParameterAsText(1)
+m = arcpy.GetParameterAsText(2)
+name = arcpy.GetParameterAsText(3)
+points = arcpy.GetParameterAsText(4)
+points = str(points)
+ve = arcpy.GetParameterAsText(5)
+ve = float(ve)
+dd = arcpy.GetParameterAsText(6)
+dd = float(dd)
+dip = arcpy.GetParameterAsText(7)
+dip = float(dip)
+
+# Define intersection plane origin
+Xplane = arcpy.GetParameterAsText(8)
+Xplane = float(Xplane)
+Yplane = arcpy.GetParameterAsText(9)
+Yplane = float(Yplane)
+Zplane = arcpy.GetParameterAsText(10)
+Zplane = float(Zplane)
+
+# ORGANIZE INPUT DATA
+shps = []
+fields = []
+
+# Convert Pix4D polylines to vertices if present
+if len(shapefile) > 0:
+    vertices = "vertices"
+    arcpy.FeatureVerticesToPoints_management(shapefile, vertices)
+    shps = ["vertices.shp"]
+    fields = ["Name"]
+    if len(str(m)) > 0:
+        m = int(m)
+        cursor2 = arcpy.da.UpdateCursor("vertices.shp", ["Name"])
+        for row in cursor2:
+            vname = row[0]
+            row[0] = vname[:m]
+            cursor2.updateRow(row)
+        del row, cursor2
+
+# Add existing point shapefiles
+if len(points) > 0:
+    vt = points.split(";")
+    for rows in vt:
+        row = rows.split(" ")
+        shps.append(row[0])
+        fields.append(row[1])
+
+# CALCULATE PROJECTION VARIABLES
+a = math.sin(math.radians(dd))
+b = math.cos(math.radians(dd))
+c = math.tan(math.radians(dip))
+d = ((a * Xplane) + (b * Yplane) - (c * Zplane))
+dnm = (a * a) + (b * b) + (c * c)
+
+# Convert dip direction to angle from x-axis
+if dd <= 90:
+    dipdir = 90 - dd
+elif dd <= 180:
+    dipdir = dd - 90
+elif dd <= 270:
+    dipdir = 270 - dd
+else:
+    dipdir = dd - 270
+
+# Line equation through origin in dip direction
+b_line = Yplane - (math.tan(math.radians(dipdir)) * Xplane)
+
+# CREATE OUTPUT TABLE
+tname = name + ".dbf"
+arcpy.CreateTable_management(workspace, tname)
+arcpy.AddField_management(tname, "X", "DOUBLE", 15, 4)
+arcpy.AddField_management(tname, "Z", "DOUBLE", 15, 4)
+arcpy.AddField_management(tname, "Name", "TEXT")
+
+# PROJECT POINTS
+count = 0
+cursor1 = arcpy.da.InsertCursor(tname, ["X", "Z", "Name"])
+
+for shp in shps:
+    f = fields[count]
+    cursor = arcpy.da.SearchCursor(shp, [f, "SHAPE@X", "SHAPE@Y", "SHAPE@Z"])
+    for row in cursor:
+        n = row[0].replace(" ", "_")
+        x, y, z = row[1], row[2], row[3]
+
+        xp = x + (a * ((d - (a * x) - (b * y) + (c * z)) / dnm))
+        yp = y + (b * ((d - (a * x) - (b * y) + (c * z)) / dnm))
+        zp = z - (c * ((d - (a * x) - (b * y) + (c * z)) / dnm))
+
+        ip_y = (zp - Zplane) / math.sin(math.radians(90 - dip))
+        ip_x = math.sqrt((xp - Xplane) ** 2 + (yp - Yplane) ** 2 + (zp - Zplane) ** 2 - ip_y ** 2)
+
+        line_y = (math.tan(math.radians(dipdir)) * xp) + b_line
+        if yp > line_y:
+            ip_x *= -1
+
+        ip_y *= ve
+        cursor1.insertRow((ip_x, ip_y, n))
+
+    count += 1
+
+del cursor, cursor1, row
+
+# CLEAN UP
+if arcpy.Exists("vertices.shp"):
+    arcpy.Delete_management("vertices.shp")
